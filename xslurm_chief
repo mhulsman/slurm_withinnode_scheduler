@@ -1,0 +1,251 @@
+#!/usr/bin/env python
+import subprocess, sys, getopt, time, shlex
+from subprocess import Popen
+import os,sys
+import signal
+import psutil
+import shutil
+import random
+import threading
+import xslurm_shared
+import socket
+import httplib
+
+
+PING_INTERVAL = 60
+PING_TIMEOUT = 1200
+REQUEST_TIMEOUT = 60
+
+REGISTRATION_ATTEMPTS = 5
+REGISTRATION_SLEEP = 30
+REGISTRATION_SLEEP_RANDOM = 180
+
+#COMMANDS
+NOOP=0
+STOP = 1
+DIE = 2
+CANCEL = 3
+REREGISTER = 4
+
+#MODES
+RUNNING = 1
+STOPPING= 2
+
+address = xslurm_shared.address
+port = xslurm_shared.port
+
+mem = psutil.virtual_memory().total / (1024.0 ** 2)
+cpu = psutil.cpu_count()
+
+opts, args = getopt.getopt(sys.argv[1:],"a:p:c:m:",["address=","port=","cpu=","mem="])
+for o, a in opts:
+    if o in ('-a', '--address'):
+        address = a
+    elif o in ('-p', '--port'):
+        port = a
+    elif o in ('-c', '--cpu'):
+        cpu = a
+    elif o in ('-', '--mem'):
+        mem = a
+
+
+myip = xslurm_shared.get_hostname()
+
+#self register
+print "[i] Preparing to register on " + address + ":" + port
+s = xslurm_shared.TimeoutServerProxy('http://' + address + ":" + port, timeout = REQUEST_TIMEOUT, allow_none = True)
+
+myid = None
+attempt = REGISTRATION_ATTEMPTS
+while attempt > 0 :
+    e_memtot = min(psutil.virtual_memory().total / (1024.0 ** 2), mem)
+    e_ncpu = min(psutil.cpu_count(), cpu)
+    try :
+        myid = s.register(myip, e_ncpu, e_memtot)
+    except (socket.error, httplib.HTTPException), serror :
+        attempt -= 1
+        sleep_time = random.randint(REGISTRATION_SLEEP, REGISTRATION_SLEEP + REGISTRATION_SLEEP_RANDOM)
+        print '[-] Failed registration, %d attempts left, sleeping for %d seconds' % (attempt, sleep_time)
+        time.sleep(sleep_time)
+    if myid is not None :
+        break
+
+print "[+] Registered with controller, got id: " + myid
+
+last_seen = time.time()
+
+if myid == "DENIED":
+    print "Cluster manager does not like me..."
+    sys.exit()
+ 
+def handler(signum, frame) :
+    print "[!] CATCH SYSTEM EXIT"
+
+    status.lock.acquire()
+    for process in status.running_processes.values():
+        process.terminate()
+    status.lock.release()
+
+    time.sleep(5) #allow jobs some time to terminate normally
+
+
+    #kill any remaining jobs
+    status.lock.acquire()
+    for process in status.running_processes.values():
+        process.kill()
+    status.lock.release()
+
+    time.sleep(5) #allow job monitor to report back the demise of the jobs
+
+    sys.exit()
+
+
+class status:
+    lock = None
+    current_cpu = e_ncpu
+    current_mem = e_memtot
+    running_processes = {}
+    return_codes = {}
+
+
+def job_monitor(jobid, process):
+    retcode = process.wait()
+
+    status.lock.acquire()
+    status.return_codes[jobid] = retcode
+    status.current_cpu += ncpu
+    status.current_mem += mem
+    del status.running_processes[jobid]
+
+    status.lock.release()
+
+
+
+status.lock = threading.RLock()
+
+
+signal.signal(signal.SIGTERM, handler)
+
+starttime = time.time()
+last_seen = time.time()
+mode = RUNNING
+
+try :
+    #lengine_monitor = psutil.Process(lengine.pid)
+
+    while True:
+        while status.return_codes:
+            status.lock.acquire()
+            nretcodes = {}
+            for jobid, rcode in status.return_codes.items():
+                try :
+                    s.job_finished(myid, jobid, rcode)
+                except (socket.error, httplib.HTTPException), serror :
+                    print '\t[!] Caught a socket error!'
+                    nretcodes[jobid] = rcode
+            status.return_codes = nretcodes
+            status.lock.release()
+       
+       
+        status.lock.acquire()    
+        while mode == RUNNING and status.current_cpu > 0 and status.current_mem > 0:
+            try :
+                jobid, command, cwd, env, ncpu, mem = s.request_job(myid, status.current_cpu, status.current_mem, (time.time() - starttime) / 60.0)
+            except (socket.error, httplib.HTTPException), serror :
+                break
+            
+            if jobid is None:
+                break
+               
+            #start job
+            curdir = os.getcwd()
+            os.chdir(cwd)
+
+            logfile = open('xslurm-%s.out' % jobid,'w')
+            logfile.write('%s - %s - %s\n' % (str(command), str(cwd), str(env)))
+            process = subprocess.Popen(command,stdout=logfile,stderr=logfile,cwd=cwd,env=env,shell=True)
+            os.chdir(curdir)
+
+            status.current_cpu -= ncpu
+            status.current_mem -= mem
+            status.running_processes[jobid] = process
+
+            
+            #start monitoring
+            t = threading.Thread(target=job_monitor, args=(jobid, process))
+            t.start()
+
+        status.lock.release()
+        
+        if mode == STOPPING and not status.running_processes:
+            break
+
+           
+        #POLL
+        cpu_usage = psutil.cpu_percent()
+        mem_usage = psutil.virtual_memory().percent
+        try:
+            commands = s.poll(myid, cpu_usage, mem_usage, mode)
+            last_seen = time.time()
+        except (socket.error, httplib.HTTPException), serror :
+            print '\t[!] Caught a socket error!'
+            if time.time() - last_seen > PING_TIMEOUT:
+                print '\t[-] Timeout triggered!'
+                mode=STOPPING
+
+        for cmd, param in commands:
+            
+            print "\t[i] POLL", cmd
+            if (cmd == STOP) :
+                mode = STOPPING
+            elif (cmd == DIE):
+                status.lock.acquire()
+                for process in status.running_processes.values():
+                    process.terminate()
+                status.lock.release()
+                
+                time.sleep(30) #allow jobs some time to terminate normally
+    
+
+                #kill any remaining jobs
+                status.lock.acquire()
+                for process in status.running_processes.values():
+                    process.kill()
+                status.lock.release()
+
+                break #exit the loop
+
+            elif (cmd == CANCEL):
+                status.lock.acquire()
+                jobid = param
+                if jobid in status.running_processes:
+                    status.running_processes[jobid].terminate()
+                status.lock.release()
+                
+                time.sleep(30) #allow jobs some time to terminate normally
+
+                #kill any remaining jobs
+                status.lock.acquire()
+                jobid = param
+                if jobid in status.running_processes:
+                    status.running_processes[jobid].kill()
+                status.lock.release()
+            elif (cmd == REREGISTER):
+                try:
+                    myid = s.register(myip, e_ncpu, e_memtot)
+                except (socket.error, httplib.HTTPException), serror :
+                    pass
+                if myid == 'DENIED':
+                    mode = STOPPING
+
+            else :
+                print "\t[-] UNKNOWN COMMAND RECEIVED, EXITING!"
+                break
+        time.sleep(PING_INTERVAL)
+    
+    s.unregister(myid)
+
+
+except (Exception, KeyboardInterrupt, SystemExit) :
+    s.unregister(myid)
+    raise
