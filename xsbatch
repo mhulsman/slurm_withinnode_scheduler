@@ -4,6 +4,7 @@ import argparse
 import os
 import socket, httplib
 import sys
+import shlex
 
 parser = argparse.ArgumentParser(description='Submit XSlurm job')
 
@@ -16,11 +17,10 @@ parser.add_argument('--requeue', action='store_true', help='Specifies that the b
 
 parser.add_argument('-d', '--dependency', default=None, help='Defer the start of this job until the specified dependencies have been satisfied completed. Param is of the form <type:job_id[:job_id][,type:job_id[:job_id]]> or <type:job_id[:job_id][?type:job_id[:job_id]]>, with type equal to after, afterany, afternotok, afterok, expand or singleton. All dependencies must be satifisied if the "," separtor used, any dependencies if the "?" separator is used.') #after:job_id[:jobid...], afterany:jobid[:jobid...], afternotok:jobid[:jobid...], afterok:jobid[:jobid...], expand:jobid, singleton
 parser.add_argument('-J', '--job-name', default=None, help='Specify a name for the job allocation. The specified name will appear along with the job id number when querying running jobs on the system. The default is the name of the batch script, or just "xsbatch" if the script is read on xsbatch''s standard input.') #after:job_id[:jobid...], afterany:jobid[:jobid...], afternotok:jobid[:jobid...], afterok:jobid[:jobid...], expand:jobid, singleton
+parser.add_argument('--parsable', action='store_true', help='Outputs only the jobid and cluster name (if present), separated by semicolon, only on successful submission.')
 
 parser.add_argument('job_args', nargs='*')
 args = parser.parse_args()
-print args
-
 
 s = xslurm_shared.TimeoutServerProxy(xslurm_shared.job_url, allow_none = True)
 
@@ -45,7 +45,9 @@ try:
     if len(time) == 3:
         hours = int(time[0])
         time = time[1:]
-    
+    else:
+        hours = 0
+
     minutes = int(time[0])
     if len(time) == 2:
         seconds = int(time[1])
@@ -56,25 +58,55 @@ try:
     
     reqtime = days * 24 * 60 + hours * 60 + minutes + (seconds > 0)
 
-except:         
-    print 'Incorrect time format: %s' % args.time
+except: 
+    print 'xsbatch: error: Incorrect time format: %s' % args.time
     raise
 
 job_name = args.job_name
 
-if not args.job_args:
-    cmd = sys.stdin.readline()
+
+job_args = args.job_args
+
+if not job_args:
+    job_args = shlex.split(sys.stdin.readline())
     if job_name is None:
         job_name = 'xsbatch'
-else:
-    cmd = " ".join(args.job_args)
-    if job_name is None:
-        job_name = os.path.basename(args.job_args[0])
+    
+        
+
+if not job_args:
+    print 'xsbatch: error: No command given on input'
+    sys.exit(1)
 
 
+cmd = " ".join(job_args) # default
 
-try:
-    jobid = s.submit_job(job_name, cmd, cwd, env, args.cpus_per_task, args.mem, reqtime, args.requeue, args.dependency)
-    print jobid
-except (socket.error, httplib.HTTPException), serror:
-    print 'Job submissiong failed, could not connect to XSlurm manager on ' + url
+if os.path.exists(job_args[0]): #executes file
+    if not os.access(args.job_args[0], os.X_OK): #executes non-executable file: search for interpreter
+        f = open(args.job_args[0],'r')
+        firstline = f.readline()
+        f.close()
+        if not firstline.startswith('#!'):
+            print 'xsbatch: error: This does not look like a bash script. The first line must start with #! followed by the path to an interpreter. For instance #!/bin/sh'
+            sys.exit(1)
+        interpreter = firstline[2:]
+        cmd = interpreter + " "  + " ".join(job_args)
+
+if job_name is None:
+    job_name = os.path.basename(job_args[0])
+
+attempt = 4
+while attempt > 0 :
+    try:
+        jobid = s.submit_job(job_name, cmd, cwd, env, args.cpus_per_task, args.mem, reqtime, args.requeue, args.dependency)
+        if args.parsable:
+            print jobid
+        else:
+            print 'Submitted batch job ' + jobid
+        sys.exit(0)
+    except (socket.error, httplib.HTTPException), serror:
+        attempt -= 1
+        time.sleep(15)
+
+print 'xsbatch: error: Job submission failed, could not connect to XSlurm manager on ' + xslurm_shared.job_url
+sys.exit(1)

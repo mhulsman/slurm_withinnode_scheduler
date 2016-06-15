@@ -17,4 +17,4 @@ try:
     for job_id in job_ids: 
         s.cancel_job(job_id)
 except (socket.error, httplib.HTTPException), serror:
-    print 'Job canceling failed, could not connect to XSlurm manager on ' + url
+    print 'Job canceling failed, could not connect to XSlurm manager on ' + xslurm_shared.job_url

@@ -2,15 +2,25 @@
 import xslurm_shared
 import getpass
 import socket, httplib
+import argparse
 
 s = xslurm_shared.TimeoutServerProxy(xslurm_shared.job_url, allow_none = True)
 
+parser = argparse.ArgumentParser(description='XSlurm Job queue listing')
+parser.add_argument('--all', action='store_true', help='Show also completed jobs.')
+parser.add_argument('--done', action='store_true', help='Show only completed jobs.')
+args = parser.parse_args()
 try:
-    jobs = s.list_jobs()
+    if args.done:
+        jobs = s.list_done_jobs()
+    elif args.all:
+        jobs = s.list_done_jobs() + s.list_jobs()
+    else:
+        jobs = s.list_jobs()
     user = getpass.getuser()
     
     print "JOBID\tPARTITION\tNAME\tUSER\tST\tTIME\tCORES\tNODES"
-    for jobid, job_name, state, run_time, cpus, node in jobs:
+    for jobid, job_name, state, runtime, cpus, node in jobs:
         days = 0
         hours = 0
         minutes = 0
@@ -28,7 +38,7 @@ try:
         if days > 0:
             runtime = ('%d-' % days) + runtime
 
-        print '%s\tnormal\t%s\t%s\t%s\t%s\t%d\t%s' % (jobid, job_name, user, state, run_time, cpus, node)
+        print '%s\tnormal\t%s\t%s\t%s\t%s\t%d\t%s' % (jobid, job_name, user, state, runtime, cpus, node)
 
 except (socket.error, httplib.HTTPException), serror:
-    print 'Queue request failed, could not connect to XSlurm manager on ' + url
+    print 'Queue request failed, could not connect to XSlurm manager on ' + xslurm_shared.job_url

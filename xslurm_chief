@@ -12,24 +12,13 @@ import socket
 import httplib
 
 
-PING_INTERVAL = 60
-PING_TIMEOUT = 1200
+PING_INTERVAL = 10
+PING_TIMEOUT = 600
 REQUEST_TIMEOUT = 60
 
 REGISTRATION_ATTEMPTS = 5
 REGISTRATION_SLEEP = 30
 REGISTRATION_SLEEP_RANDOM = 180
-
-#COMMANDS
-NOOP=0
-STOP = 1
-DIE = 2
-CANCEL = 3
-REREGISTER = 4
-
-#MODES
-RUNNING = 1
-STOPPING= 2
 
 address = xslurm_shared.address
 port = xslurm_shared.port
@@ -50,9 +39,10 @@ for o, a in opts:
 
 
 myip = xslurm_shared.get_hostname()
+myid = myip #for now
 
 #self register
-print "[i] Preparing to register on " + address + ":" + port
+print ("[%s] Preparing to register on " % myip) + address + ":" + port
 s = xslurm_shared.TimeoutServerProxy('http://' + address + ":" + port, timeout = REQUEST_TIMEOUT, allow_none = True)
 
 myid = None
@@ -70,35 +60,43 @@ while attempt > 0 :
     if myid is not None :
         break
 
-print "[+] Registered with controller, got id: " + myid
 
 last_seen = time.time()
 
 if myid == "DENIED":
-    print "Cluster manager does not like me..."
+    print "[%s] Cluster manager does not like me..." % myip
     sys.exit()
+else:
+    print ("[%s] Registered with controller, got id: " % myip) + myid
  
 def handler(signum, frame) :
-    print "[!] CATCH SYSTEM EXIT"
+    print ("[%s] CATCH SYSTEM EXIT" % myid)
+    sys.stdout.flush()
+    mode = xslurm_shared.STOPPING
 
+    terminate_jobs()
+    time.sleep(5) #allow job monitor to report back the demise of the jobs
+    sys.exit()
+
+def terminate_jobs():
     status.lock.acquire()
     for process in status.running_processes.values():
         process.terminate()
     status.lock.release()
 
-    time.sleep(5) #allow jobs some time to terminate normally
+    counter = 20
+    while counter > 0 and len(status.running_processes) > 0:
+        time.sleep(1)
+        counter -= 1
+        print counter
 
 
     #kill any remaining jobs
     status.lock.acquire()
     for process in status.running_processes.values():
+        print "\t[%s] Killing remaining process" % myid
         process.kill()
     status.lock.release()
-
-    time.sleep(5) #allow job monitor to report back the demise of the jobs
-
-    sys.exit()
-
 
 class status:
     lock = None
@@ -108,8 +106,11 @@ class status:
     return_codes = {}
 
 
-def job_monitor(jobid, process):
-    retcode = process.wait()
+def job_monitor(jobid, process, ncpu, mem):
+    retcode = None
+    while retcode is None:
+        retcode = process.poll()
+        time.sleep(1)
 
     status.lock.acquire()
     status.return_codes[jobid] = retcode
@@ -117,6 +118,8 @@ def job_monitor(jobid, process):
     status.current_mem += mem
     del status.running_processes[jobid]
 
+
+    event_timer.set()
     status.lock.release()
 
 
@@ -128,12 +131,18 @@ signal.signal(signal.SIGTERM, handler)
 
 starttime = time.time()
 last_seen = time.time()
-mode = RUNNING
+mode = xslurm_shared.RUNNING
+
+event_timer = threading.Event()
 
 try :
     #lengine_monitor = psutil.Process(lengine.pid)
 
     while True:
+        sys.stderr.flush()
+        sys.stdout.flush()
+        event_timer.clear()
+
         while status.return_codes:
             status.lock.acquire()
             nretcodes = {}
@@ -141,14 +150,14 @@ try :
                 try :
                     s.job_finished(myid, jobid, rcode)
                 except (socket.error, httplib.HTTPException), serror :
-                    print '\t[!] Caught a socket error!'
+                    print '[%s] Caught a socket error!' % myid
                     nretcodes[jobid] = rcode
             status.return_codes = nretcodes
             status.lock.release()
        
        
         status.lock.acquire()    
-        while mode == RUNNING and status.current_cpu > 0 and status.current_mem > 0:
+        while mode == xslurm_shared.RUNNING and status.current_cpu > 0 and status.current_mem > 0:
             try :
                 jobid, command, cwd, env, ncpu, mem = s.request_job(myid, status.current_cpu, status.current_mem, (time.time() - starttime) / 60.0)
             except (socket.error, httplib.HTTPException), serror :
@@ -162,8 +171,9 @@ try :
             os.chdir(cwd)
 
             logfile = open('xslurm-%s.out' % jobid,'w')
-            logfile.write('%s - %s - %s\n' % (str(command), str(cwd), str(env)))
-            process = subprocess.Popen(command,stdout=logfile,stderr=logfile,cwd=cwd,env=env,shell=True)
+
+            command = shlex.split(command)
+            process = subprocess.Popen(command,stdout=logfile,stderr=logfile,cwd=cwd,env=env)
             os.chdir(curdir)
 
             status.current_cpu -= ncpu
@@ -172,12 +182,12 @@ try :
 
             
             #start monitoring
-            t = threading.Thread(target=job_monitor, args=(jobid, process))
+            t = threading.Thread(target=job_monitor, args=(jobid, process, ncpu, mem))
             t.start()
 
         status.lock.release()
         
-        if mode == STOPPING and not status.running_processes:
+        if mode == xslurm_shared.STOPPING and not status.running_processes:
             break
 
            
@@ -188,34 +198,23 @@ try :
             commands = s.poll(myid, cpu_usage, mem_usage, mode)
             last_seen = time.time()
         except (socket.error, httplib.HTTPException), serror :
-            print '\t[!] Caught a socket error!'
+            print '[%s] Caught a socket error!' % myid
             if time.time() - last_seen > PING_TIMEOUT:
-                print '\t[-] Timeout triggered!'
-                mode=STOPPING
+                print '[%s] Timeout triggered!' % myid
+                mode=xslurm_shared.STOPPING
 
         for cmd, param in commands:
-            
-            print "\t[i] POLL", cmd
-            if (cmd == STOP) :
-                mode = STOPPING
-            elif (cmd == DIE):
-                status.lock.acquire()
-                for process in status.running_processes.values():
-                    process.terminate()
-                status.lock.release()
+            if (cmd == xslurm_shared.STOP) :
+                print '[%s] Received command to stop.' % myid
+                mode = xslurm_shared.STOPPING
+            elif (cmd == xslurm_shared.DIE):
+                print '[%s] Received command to die.' % myid
+                mode = xslurm_shared.STOPPING
+
+                terminate_jobs()
                 
-                time.sleep(30) #allow jobs some time to terminate normally
-    
-
-                #kill any remaining jobs
-                status.lock.acquire()
-                for process in status.running_processes.values():
-                    process.kill()
-                status.lock.release()
-
-                break #exit the loop
-
-            elif (cmd == CANCEL):
+            elif (cmd == xslurm_shared.CANCEL):
+                print ('[%s] Received command to cancel job: ' % myid)+ str(param)
                 status.lock.acquire()
                 jobid = param
                 if jobid in status.running_processes:
@@ -230,22 +229,30 @@ try :
                 if jobid in status.running_processes:
                     status.running_processes[jobid].kill()
                 status.lock.release()
-            elif (cmd == REREGISTER):
+            elif (cmd == xslurm_shared.REREGISTER):
+                print ('[i] Received command to reregister.' % myid)
                 try:
                     myid = s.register(myip, e_ncpu, e_memtot)
                 except (socket.error, httplib.HTTPException), serror :
                     pass
                 if myid == 'DENIED':
-                    mode = STOPPING
+                    print ('[i] Denied reregistration, stopping.' %myid)
+                    mode = xslurm_shared.STOPPING
 
             else :
-                print "\t[-] UNKNOWN COMMAND RECEIVED, EXITING!"
+                print "[-] UNKNOWN COMMAND RECEIVED, EXITING!" %myid
                 break
-        time.sleep(PING_INTERVAL)
-    
+        event_timer.wait(PING_INTERVAL)
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+
     s.unregister(myid)
 
 
 except (Exception, KeyboardInterrupt, SystemExit) :
+    sys.stdout.flush()
+    sys.stderr.flush()
+
     s.unregister(myid)
     raise
