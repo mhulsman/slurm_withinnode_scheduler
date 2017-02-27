@@ -1,4 +1,4 @@
 #!/bin/bash
 
-xslurm_chief "$@"
+xslurm_chief "$@" 
 

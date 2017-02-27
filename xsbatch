@@ -14,6 +14,7 @@ parser.add_argument('-t','--time', default='1:0:0', help='Advise on total run ti
 parser.add_argument('-p','--partition', default='none', help='Included for SLURM compatibility, not used') # not used
 parser.add_argument('-q', '--qos', default='none', help='Included for SLURM compatibility, not used') # not used
 parser.add_argument('--requeue', action='store_true', help='Specifies that the batch job should eligible to being requeue. The job may be requeued after node failure. When a job is requeued, the batch script is initiated from its beginning.')
+parser.add_argument('-n', '--ntasks',type=float, default=1, help='Number of tasks to run') 
 
 parser.add_argument('-d', '--dependency', default=None, help='Defer the start of this job until the specified dependencies have been satisfied completed. Param is of the form <type:job_id[:job_id][,type:job_id[:job_id]]> or <type:job_id[:job_id][?type:job_id[:job_id]]>, with type equal to after, afterany, afternotok, afterok, expand or singleton. All dependencies must be satifisied if the "," separtor used, any dependencies if the "?" separator is used.') #after:job_id[:jobid...], afterany:jobid[:jobid...], afternotok:jobid[:jobid...], afterok:jobid[:jobid...], expand:jobid, singleton
 parser.add_argument('-J', '--job-name', default=None, help='Specify a name for the job allocation. The specified name will appear along with the job id number when querying running jobs on the system. The default is the name of the batch script, or just "xsbatch" if the script is read on xsbatch''s standard input.') #after:job_id[:jobid...], afterany:jobid[:jobid...], afternotok:jobid[:jobid...], afterok:jobid[:jobid...], expand:jobid, singleton
@@ -30,28 +31,28 @@ env = os.environ
 
 #parse time format
 try:
-    time = args.time.split('-')
+    atime = args.time.split('-')
 
-    if len(time) == 2:
-        days = int(time[0])
-        time = time[1]
-    elif len(time) == 1:
+    if len(atime) == 2:
+        days = int(atime[0])
+        atime = atime[1]
+    elif len(atime) == 1:
         days = 0
-        time = time[0]
+        atime = atime[0]
     else:
         raise RuntimeError
     
-    time = time.split(':')
-    if len(time) == 3:
-        hours = int(time[0])
-        time = time[1:]
+    atime = atime.split(':')
+    if len(atime) == 3:
+        hours = int(atime[0])
+        atime = atime[1:]
     else:
         hours = 0
 
-    minutes = int(time[0])
-    if len(time) == 2:
-        seconds = int(time[1])
-    elif len(time) == 1:
+    minutes = int(atime[0])
+    if len(atime) == 2:
+        seconds = int(atime[1])
+    elif len(atime) == 1:
         seconds = 0
     else:
         raise RuntimeError
@@ -98,11 +99,12 @@ if job_name is None:
 attempt = 4
 while attempt > 0 :
     try:
-        jobid = s.submit_job(job_name, cmd, cwd, env, args.cpus_per_task, args.mem, reqtime, args.requeue, args.dependency)
-        if args.parsable:
-            print jobid
-        else:
-            print 'Submitted batch job ' + jobid
+        for i in range(int(args.ntasks)):
+            jobid = s.submit_job(job_name, cmd, cwd, env, args.cpus_per_task, args.mem, reqtime, args.requeue, args.dependency)
+            if args.parsable:
+                print jobid
+            else:
+                print 'Submitted batch job ' + jobid
         sys.exit(0)
     except (socket.error, httplib.HTTPException), serror:
         attempt -= 1

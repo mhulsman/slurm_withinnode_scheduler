@@ -10,7 +10,7 @@ import threading
 import xslurm_shared
 import socket
 import httplib
-
+import numpy
 
 PING_INTERVAL = 10
 PING_TIMEOUT = 600
@@ -75,6 +75,8 @@ def handler(signum, frame) :
     mode = xslurm_shared.STOPPING
 
     terminate_jobs()
+    print ("[%s] CATCH SYSTEM EXIT 2" % myid)
+    sys.stdout.flush()
     time.sleep(5) #allow job monitor to report back the demise of the jobs
     sys.exit()
 
@@ -103,6 +105,7 @@ class status:
     current_cpu = e_ncpu
     current_mem = e_memtot
     running_processes = {}
+    assigned_jobs = {}
     return_codes = {}
 
 
@@ -156,34 +159,51 @@ try :
             status.lock.release()
        
        
-        status.lock.acquire()    
-        while mode == xslurm_shared.RUNNING and status.current_cpu > 0 and status.current_mem > 0:
-            try :
-                jobid, command, cwd, env, ncpu, mem = s.request_job(myid, status.current_cpu, status.current_mem, (time.time() - starttime) / 60.0)
-            except (socket.error, httplib.HTTPException), serror :
-                break
+        status.lock.acquire()   
+        
+        if mode == xslurm_shared.RUNNING and status.current_cpu > 0 and status.current_mem > 0:
+            if status.assigned_jobs:
+                jobs = status.assigned_jobs.values()
+            else:
+                try :
+                    jobs = s.request_jobs(myid, status.current_cpu, status.current_mem)
+                except (socket.error, httplib.HTTPException), serror :
+                    break
             
-            if jobid is None:
-                break
-               
-            #start job
-            curdir = os.getcwd()
-            os.chdir(cwd)
+            for job in jobs: 
+                jobid, command, cwd, env, ncpu, mem, state = job
+                if state == 'ASSIGNED':
+                    if status.current_cpu > ncpu and status.current_mem > mem:
+                        try :
+                            permission = s.can_run_assigned_job(myid, jobid)
+                        except (socket.error, httplib.HTTPException), serror :
+                            continue
+                        del status.assigned_jobs[jobid]
+                        if not permission:
+                            continue
+                    else:
+                        if not jobid in status.assigned_jobs:
+                            status.assigned_jobs[jobid] = job
+                        continue
 
-            logfile = open('xslurm-%s.out' % jobid,'w')
+                #start job
+                curdir = os.getcwd()
+                os.chdir(cwd)
 
-            command = shlex.split(command)
-            process = subprocess.Popen(command,stdout=logfile,stderr=logfile,cwd=cwd,env=env)
-            os.chdir(curdir)
+                logfile = open('xslurm-%s.out' % jobid,'w')
 
-            status.current_cpu -= ncpu
-            status.current_mem -= mem
-            status.running_processes[jobid] = process
+                command = shlex.split(command)
+                process = subprocess.Popen(command,stdout=logfile,stderr=logfile,cwd=cwd,env=env)
+                os.chdir(curdir)
 
-            
-            #start monitoring
-            t = threading.Thread(target=job_monitor, args=(jobid, process, ncpu, mem))
-            t.start()
+                status.current_cpu -= ncpu
+                status.current_mem -= mem
+                status.running_processes[jobid] = process
+
+                
+                #start monitoring
+                t = threading.Thread(target=job_monitor, args=(jobid, process, ncpu, mem))
+                t.start()
 
         status.lock.release()
         
@@ -192,10 +212,11 @@ try :
 
            
         #POLL
-        cpu_usage = psutil.cpu_percent()
+        cpu_usage = float(numpy.mean(psutil.cpu_percent(percpu=True)))
         mem_usage = psutil.virtual_memory().percent
+        idle = len(status.running_processes) == 0
         try:
-            commands = s.poll(myid, cpu_usage, mem_usage, mode)
+            commands = s.poll(myid, cpu_usage, mem_usage, mode, idle)
             last_seen = time.time()
         except (socket.error, httplib.HTTPException), serror :
             print '[%s] Caught a socket error!' % myid
@@ -212,7 +233,13 @@ try :
                 mode = xslurm_shared.STOPPING
 
                 terminate_jobs()
-                
+            elif (cmd == xslurm_shared.DEASSIGN):
+                print ('[%s] Received command to deassign job: ' % myid)+ str(param)
+                status.lock.acquire()
+                jobid = param
+                if jobid in status.assigned_jobs:
+                    del status.assigned_jobs[jobid]
+                status.lock.release()
             elif (cmd == xslurm_shared.CANCEL):
                 print ('[%s] Received command to cancel job: ' % myid)+ str(param)
                 status.lock.acquire()
@@ -221,7 +248,7 @@ try :
                     status.running_processes[jobid].terminate()
                 status.lock.release()
                 
-                time.sleep(30) #allow jobs some time to terminate normally
+                time.sleep(5) #allow jobs some time to terminate normally
 
                 #kill any remaining jobs
                 status.lock.acquire()
