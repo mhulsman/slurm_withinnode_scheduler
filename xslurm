@@ -25,7 +25,7 @@ MAGENTA=4
 BLUE=5
 CYAN=6
 
-TIMEOUT = 600
+TIMEOUT = 1200
 
 #current screen info
 class gb:
@@ -124,13 +124,13 @@ class JobManager(object):
         self.jobs_done = []
         self.lock = threading.RLock()
 
-
+        self.failed_jobs = 0
         self.running_jobs = 0
         self.total_jobs = 0
     
     
     def get_job_stats(self):
-        return (self.total_jobs, self.running_jobs)
+        return (self.total_jobs, self.running_jobs, self.failed_jobs)
     
 
     def active_engines(self):
@@ -189,7 +189,7 @@ class JobManager(object):
         job = Job(job_name, jobid, cmd, cwd, env, ncpu, mem, reqtime, requeue, dependency)
         self.jobs_by_id[jobid] = job
 
-        add_log_line(gb,"Job (id: %s, ncore: %d, mem: %d mb) submitted." % (jobid, ncpu, mem),GREEN)
+        add_log_line(gb,"Job %s (id: %s, ncore: %d, mem: %d mb) submitted." % (job_name, jobid, ncpu, mem),GREEN)
         return jobid
 
     def cancel_job(self, jobid):
@@ -208,7 +208,7 @@ class JobManager(object):
                     except:
                         pass
 
-                    add_log_line(gb,"Job (id: %s, running on %s) has been send a cancel signal." % (job.jobid, job.node_id),YELLOW)
+                    add_log_line(gb,"Job %s (id: %s, running on %s) has been send a cancel signal." % (job.job_name, job.jobid, job.node_id),YELLOW)
                     #now wait for cancel to propagate
                 elif job.state == 'ASSIGNED':
                     node_id = job.node_id
@@ -216,10 +216,10 @@ class JobManager(object):
                         engines.send_command(node_id, xslurm_shared.DEASSIGN, jobid)
                     except:
                         pass
-                    self.job_done(job.jobid, -1, 'Cancelled by user')
+                    self.job_done(job.jobid, -255, 'Cancelled by user')
                 else:
-                    self.job_done(job.jobid, -1, 'Cancelled by user')
-                    add_log_line(gb,"Job (id: %s) cancelled." % job.jobid,YELLOW)
+                    self.job_done(job.jobid, -255, 'Cancelled by user')
+                    add_log_line(gb,"Job %s (id: %s) cancelled." % (job.job_name, job.jobid),YELLOW)
                 job.state = 'CANCELLED'
             else:
                 add_log_line(gb,"Attempt to cancel unknown job (id: %s)." % jobid,YELLOW)
@@ -259,9 +259,9 @@ class JobManager(object):
     def request_jobs(self, myid,current_cpu, current_mem):
         #add_log_line(gb,"Node %s requests for job with %d cpus and %d mb mem within %s time" % (myid, current_cpu, current_mem, (5 * 24 * 60.0) - current_time), BLUE)
         if not myid in engines.engine_by_id:
-            return []
-
-        timeleft = engines.engine_by_id[myid].timeleft
+            timeleft = 5 * 24 * 60 * 60
+        else:
+            timeleft = engines.engine_by_id[myid].timeleft
 
         self.lock.acquire()
         try:
@@ -271,10 +271,10 @@ class JobManager(object):
                 if job.state in queue_states and job.reqtime <= timeleft:
                     if not (job.ncpu <= current_cpu and job.mem <= current_mem):
                         job.state = 'ASSIGNED'
-                        add_log_line(gb,"Job (id: %s) assigned to node %s (%d/%d remaining)" % (job.jobid, myid, current_cpu-job.ncpu, current_mem-job.mem), BLUE)
+                        add_log_line(gb,"Job %s (id: %s) assigned to node %s (%d/%d remaining)" % (job.job_name, job.jobid, myid, current_cpu-job.ncpu, current_mem-job.mem), BLUE)
                     else:
                         job.state = 'RUNNING'
-                        add_log_line(gb,"Job (id: %s) started on node %s (%d/%d remaining)" % (job.jobid, myid, current_cpu-job.ncpu, current_mem-job.mem), BLUE)
+                        add_log_line(gb,"Job %s (id: %s) started on node %s (%d/%d remaining)" % (job.job_name, job.jobid, myid, current_cpu-job.ncpu, current_mem-job.mem), BLUE)
                         self.running_jobs += 1
                         job.starttime = time.time()
                
@@ -298,7 +298,7 @@ class JobManager(object):
                             pass
 
                         job.state = 'RUNNING'
-                        add_log_line(gb,"Job (id: %s) reassigned and started on node %s (%d/%d remaining)" % (job.jobid, myid, current_cpu, current_mem), BLUE)
+                        add_log_line(gb,"Job %s (id: %s) reassigned and started on node %s (%d/%d remaining)" % (job.job_name, job.jobid, myid, current_cpu, current_mem), BLUE)
                         self.running_jobs += 1
                         job.starttime = time.time()
                 
@@ -359,12 +359,12 @@ class JobManager(object):
         try: 
             job = self.jobs_by_id.get(jobid,None)
             if not job is None:
-                if not job.node_id is None:
+                if not job.node_id is None and not return_code == -255:
                     job.endtime = time.time()
                     job.node_id = None
                     self.running_jobs -=1
 
-                if return_code != 0 and job.requeue > 0:
+                if return_code != 0 and return_code != -255 and job.requeue > 0: #-255 is cancelled
                     job.requeue -= 1
                     job.state = 'REQUEUED'
                     job.starttime = None
@@ -373,11 +373,17 @@ class JobManager(object):
                     del self.jobs_by_id[jobid]
                     self.jobs_done.append(job)
                     self.total_jobs -= 1
+                    if return_code != 0 and return_code != -255:
+                        self.failed_jobs += 1
 
                 job.return_code = return_code
                 job.reason = reason
         finally:        
             self.lock.release()
+        if not job is None:
+            return job.job_name
+        else:
+            return ""
 
     def job_finished(self, myid, jobid, return_code):
         self.lock.acquire()
@@ -397,15 +403,14 @@ class JobManager(object):
             if not jobid in self.jobs_by_id:
                 add_log_line(gb,"Unknown job (id: %s) completed at %s (%s)" % (jobid, myid, reason),YELLOW)
             else:
-                self.job_done(jobid, return_code, reason)
+                name = self.job_done(jobid, return_code, reason)
         finally:
             self.lock.release()
         
-        
         if return_code == 0:
-            add_log_line(gb,"Job (id: %s) completed." % jobid,GREEN)
+            add_log_line(gb,"Job %s (id: %s) completed." % (name, jobid),GREEN)
         else:
-            add_log_line(gb,"Job (id: %s, node: %s) failed, reason: %s."  % (jobid, myid, reason),YELLOW)
+            add_log_line(gb,"Job %s (id: %s, node: %s) failed, reason: %s."  % (name, jobid, myid, reason),YELLOW)
 
 
 jobs = JobManager()
@@ -588,7 +593,7 @@ class EngineManager(object):
             set_status_message(gb,"Local engine terminated",GREEN)
 
     #FIXME
-    def start_slurm(self, gb,n, stime):
+    def start_slurm(self, gb,n, stime, partition):
         self.lock.acquire()
         try:
             if(n < 0):
@@ -597,11 +602,11 @@ class EngineManager(object):
                 set_status_message(gb,"Starting SLURM engines",YELLOW)
                 engine_path = "slurm_to_xslurm"
                 if n > 1:
-                    cmd = "sbatch -N 1 --parsable --array=0-%d -J xslurm -t " % (n-1)
+                    cmd = "sbatch -N 1 -p %s --parsable --array=0-%d -J xslurm -t " % (partition, n-1)
                 else:
-                    cmd = "sbatch -N 1 --parsable -J xslurm -t "
+                    cmd = "sbatch -N 1 -p %s --parsable -J xslurm -t " % partition
                 
-                cmd = cmd + stime + " -p normal slurm_to_xslurm -a " + str(status.address) + " -p " + str(status.port)
+                cmd = cmd + stime + " slurm_to_xslurm -a " + str(status.address) + " -p " + str(status.port)
                 args = shlex.split(cmd)
             
                 eid = Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE).communicate()[0]
@@ -724,7 +729,7 @@ class EngineManager(object):
                 self.engine_by_id[myid] = e
                 if myid == status.address.split('-')[0]:
                     e.cluster_id = False
-                    e.timeleft = 5 * 24 * 60
+                    e.timeleft = 5 * 24 * 60 * 60
             
                 totalgb = totmem / 1024.0
                 average_use = totalgb / float(cores)
@@ -746,7 +751,7 @@ class EngineManager(object):
            
             commands = e.pending_commands
             # kill if idle, but not if local engine or if started in last 60 seconds
-            if idle and status.kill_idle and not myid == status.address.split('-')[0] and not (e.lastseen - e.starttime) < 60):
+            if idle and status.kill_idle and not myid == status.address.split('-')[0] and not ((e.lastseen - e.starttime) < 60):
                 add_log_line(gb,"Stopping idle engine: " + myid, YELLOW)
 
                 commands.append((xslurm_shared.STOP,None))
@@ -930,7 +935,7 @@ def thread_display_status(gb,status):
         local_running = engines.check_local_engine()
         equeue = engines.cluster_queued_engines
         erunning = engines.cluster_running_engines
-        njobs, nrunning = jobs.get_job_stats()
+        njobs, nrunning, nfailed = jobs.get_job_stats()
 
         #active_engines = jobs.active_engines()
         #active_engines.discard(mylocal_id)
@@ -942,7 +947,7 @@ def thread_display_status(gb,status):
                 sizey = gb.wcom_status.getmaxyx()[1]
                 gb.wcom_status.erase()
                 gb.wcom_status.addstr(1,1,"Jobs: ")
-                gb.wcom_status.addstr(1,18,"%d/%d" % (nrunning, njobs),curses.color_pair(GREEN))
+                gb.wcom_status.addstr(1,18,"%d/%d (%d failed)" % (nrunning, njobs, nfailed),curses.color_pair(GREEN))
                 
                 
                 gb.wcom_status.addstr(3,1,"Local engine: ")
@@ -1090,6 +1095,8 @@ def build_windows(gb):
 
 #add line to log windows
 def add_log_line(gb,line,color=0):
+    timestring = time.strftime("%H:%M:%S", time.gmtime()) 
+    line = timestring + ": " + line
     gb.lock.acquire()
     try:
         if(line and line[-1] == '\n'):
@@ -1282,10 +1289,13 @@ def main(scr, *args, **kwds):
             elif c == ord('d'):  #START SLURM engines
                 cmd = get_number(gb, "Number of engines (def=1): ",1)
                 runtime = enter_command(gb, "Enter time (default=5-0:0:0): ")
+                partition = enter_command(gb, "Enter partition (default=normal): ")
                 if runtime == "":
                     runtime = '5-0:0:0'
+                if partition =="":
+                    partition = 'normal'
                 if(not cmd is None):
-                    engines.start_slurm(gb,cmd, runtime)
+                    engines.start_slurm(gb,cmd, runtime, partition)
             elif c == ord('p'):
                 jobpattern = enter_command(gb, 'Enter job name pattern to prioritize: ')
                 if not jobpattern == '':

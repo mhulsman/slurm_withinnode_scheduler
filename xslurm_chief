@@ -11,6 +11,9 @@ import xslurm_shared
 import socket
 import httplib
 import numpy
+import resource
+
+resource.setrlimit(resource.RLIMIT_NPROC, (8192, 16000))
 
 PING_INTERVAL = 10
 PING_TIMEOUT = 600
@@ -42,8 +45,8 @@ myip = xslurm_shared.get_hostname()
 myid = myip #for now
 
 #self register
-print ("[%s] Preparing to register on " % myip) + address + ":" + port
-s = xslurm_shared.TimeoutServerProxy('http://' + address + ":" + port, timeout = REQUEST_TIMEOUT, allow_none = True)
+print ("[%s] Preparing to register on " % str(myip)) + str(address) + ":" + str(port)
+s = xslurm_shared.TimeoutServerProxy('http://' + str(address) + ":" + str(port), timeout = REQUEST_TIMEOUT, allow_none = True)
 
 myid = None
 attempt = REGISTRATION_ATTEMPTS
@@ -83,7 +86,10 @@ def handler(signum, frame) :
 def terminate_jobs():
     status.lock.acquire()
     for process in status.running_processes.values():
-        process.terminate()
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except OSError:
+            pass
     status.lock.release()
 
     counter = 20
@@ -97,7 +103,10 @@ def terminate_jobs():
     status.lock.acquire()
     for process in status.running_processes.values():
         print "\t[%s] Killing remaining process" % myid
-        process.kill()
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except OSError:
+            pass
     status.lock.release()
 
 class status:
@@ -111,19 +120,26 @@ class status:
 
 def job_monitor(jobid, process, ncpu, mem):
     retcode = None
+    report_time = time.time()
+    print('Job %s monitoring started' % str(jobid))
     while retcode is None:
         retcode = process.poll()
+        cur_time = time.time()
+        if (cur_time - report_time) > 600.0:
+            print('Job %s still running' % str(jobid))
+            report_time = cur_time
         time.sleep(1)
 
+    print("Job %s done with rcode %s" % (str(jobid), str(retcode)))
     status.lock.acquire()
     status.return_codes[jobid] = retcode
     status.current_cpu += ncpu
     status.current_mem += mem
     del status.running_processes[jobid]
 
-
     event_timer.set()
     status.lock.release()
+    print("Job %s monitoring stopped" % str(jobid))
 
 
 
@@ -152,8 +168,9 @@ try :
             for jobid, rcode in status.return_codes.items():
                 try :
                     s.job_finished(myid, jobid, rcode)
+                    print 'Reported that job %s finished with rcode %s' % (str(jobid), str(rcode))
                 except (socket.error, httplib.HTTPException), serror :
-                    print '[%s] Caught a socket error!' % myid
+                    print '[%s] Caught a socket error at time %f for jobid %s!' % (myid, time.time(), str(jobid))
                     nretcodes[jobid] = rcode
             status.return_codes = nretcodes
             status.lock.release()
@@ -168,8 +185,8 @@ try :
                 try :
                     jobs = s.request_jobs(myid, status.current_cpu, status.current_mem)
                 except (socket.error, httplib.HTTPException), serror :
-                    break
-            
+                    jobs = []
+
             for job in jobs: 
                 jobid, command, cwd, env, ncpu, mem, state = job
                 if state == 'ASSIGNED':
@@ -193,7 +210,7 @@ try :
                 logfile = open('xslurm-%s.out' % jobid,'w')
 
                 command = shlex.split(command)
-                process = subprocess.Popen(command,stdout=logfile,stderr=logfile,cwd=cwd,env=env)
+                process = subprocess.Popen(command,stdout=logfile,stderr=logfile,cwd=cwd,env=env,preexec_fn=os.setpgrp)
                 os.chdir(curdir)
 
                 status.current_cpu -= ncpu
@@ -206,7 +223,7 @@ try :
                 t.start()
 
         status.lock.release()
-        
+
         if mode == xslurm_shared.STOPPING and not status.running_processes:
             break
 
@@ -219,7 +236,7 @@ try :
             commands = s.poll(myid, cpu_usage, mem_usage, mode, idle)
             last_seen = time.time()
         except (socket.error, httplib.HTTPException), serror :
-            print '[%s] Caught a socket error!' % myid
+            print '[%s] Caught a socket error for command poll !' % myid
             if time.time() - last_seen > PING_TIMEOUT:
                 print '[%s] Timeout triggered!' % myid
                 mode=xslurm_shared.STOPPING
@@ -245,7 +262,12 @@ try :
                 status.lock.acquire()
                 jobid = param
                 if jobid in status.running_processes:
-                    status.running_processes[jobid].terminate()
+                    
+                    p = status.running_processes[jobid]
+                    try:
+                        os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                    except OSError:
+                        pass
                 status.lock.release()
                 
                 time.sleep(5) #allow jobs some time to terminate normally
@@ -254,20 +276,24 @@ try :
                 status.lock.acquire()
                 jobid = param
                 if jobid in status.running_processes:
-                    status.running_processes[jobid].kill()
+                    p = status.running_processes[jobid]
+                    try:
+                        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                    except OSError:
+                        pass
                 status.lock.release()
             elif (cmd == xslurm_shared.REREGISTER):
-                print ('[i] Received command to reregister.' % myid)
+                print ('[%s] Received command to reregister.' % myid)
                 try:
                     myid = s.register(myip, e_ncpu, e_memtot)
                 except (socket.error, httplib.HTTPException), serror :
                     pass
                 if myid == 'DENIED':
-                    print ('[i] Denied reregistration, stopping.' %myid)
+                    print ('[%s] Denied reregistration, stopping.' %myid)
                     mode = xslurm_shared.STOPPING
 
             else :
-                print "[-] UNKNOWN COMMAND RECEIVED, EXITING!" %myid
+                print "[%s] UNKNOWN COMMAND RECEIVED, EXITING!" %myid
                 break
         event_timer.wait(PING_INTERVAL)
 

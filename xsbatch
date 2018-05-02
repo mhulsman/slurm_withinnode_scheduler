@@ -5,6 +5,7 @@ import os
 import socket, httplib
 import sys
 import shlex
+import time
 
 parser = argparse.ArgumentParser(description='Submit XSlurm job')
 

@@ -2,6 +2,7 @@
 import xslurm_shared
 import socket,httplib
 import argparse
+import sys
 s = xslurm_shared.TimeoutServerProxy(xslurm_shared.job_url, allow_none = True)
 
 parser = argparse.ArgumentParser(description='Cancel XSlurm job')

@@ -1,5 +1,11 @@
-import xmlrpclib
-import httplib
+import sys
+if sys.version_info.major == 2:
+    import xmlrpclib
+    import httplib
+else:
+    import xmlrpc.client as xmlrpclib
+    import http.client as httplib
+
 import socket
 from dns import resolver, reversename
 import time
@@ -48,7 +54,6 @@ def get_hostname():
     if not cache_hostname is None:
         return cache_hostname
     adresses = ['google.com', 'nu.nl', 'tweakers.net']
-    
     while adresses:
         try:
             socket.setdefaulttimeout(30)
@@ -64,10 +69,16 @@ def get_hostname():
     try:
         addr=reversename.from_address(myip)
         myip = str(resolver.query(addr,"PTR")[0])[:-1]
-    except Exception,e:
+    except Exception as e:
+        myip = socket.gethostname().split('.')[0]
         pass
-    
+   
+    if '-bb' in myip:
+        myip = myip.split('-bb')[0]
+    if '.' in myip:
+        myip = myip.split('.')[0]
     cache_hostname = myip
+   
     return myip
 
 def short_name(name):

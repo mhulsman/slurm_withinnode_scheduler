@@ -12,7 +12,7 @@ setup(
     version="0.1",
     scripts = ['xsqueue', 'xsbatch', 'xscancel','xslurm','xslurm_chief','slurm_to_xslurm'],
      install_requires=['numpy>=1.4.1','psutil','dnspython'],
-     py_modules=['xslurm_shared'],
+     py_modules=['xslurm_shared','xsb'],
      author = "M. Hulsman",
      author_email = "m.hulsman@tudelft.nl",
      description = "XSlurm is a batch system on top of SLURM, which allows for core-level scheduling on systems that only allow  node-level scheduling.",
