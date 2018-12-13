@@ -151,7 +151,7 @@ signal.signal(signal.SIGTERM, handler)
 starttime = time.time()
 last_seen = time.time()
 mode = xslurm_shared.RUNNING
-
+idle_start = 0
 event_timer = threading.Event()
 
 try :
@@ -178,12 +178,13 @@ try :
        
         status.lock.acquire()   
         
-        if mode == xslurm_shared.RUNNING and status.current_cpu > 0 and status.current_mem > 0:
+        if mode == xslurm_shared.RUNNING and status.current_cpu > 0 and status.current_mem > 0 and psutil.virtual_memory().percent < 75.0:
             if status.assigned_jobs:
                 jobs = status.assigned_jobs.values()
             else:
                 try :
                     jobs = s.request_jobs(myid, status.current_cpu, status.current_mem)
+                    print(jobs, status.current_cpu, status.current_mem)
                 except (socket.error, httplib.HTTPException), serror :
                     jobs = []
 
@@ -232,8 +233,15 @@ try :
         cpu_usage = float(numpy.mean(psutil.cpu_percent(percpu=True)))
         mem_usage = psutil.virtual_memory().percent
         idle = len(status.running_processes) == 0
+        if idle and idle_start == 0:
+            idle_start = time.time()
+        elif not idle:
+            idle_start = 0
         try:
-            commands = s.poll(myid, cpu_usage, mem_usage, mode, idle)
+            if idle_start == 0:
+                commands = s.poll(myid, cpu_usage, mem_usage, mode, 0.0)
+            else:
+                commands = s.poll(myid, cpu_usage, mem_usage, mode, time.time() - idle_start)
             last_seen = time.time()
         except (socket.error, httplib.HTTPException), serror :
             print '[%s] Caught a socket error for command poll !' % myid

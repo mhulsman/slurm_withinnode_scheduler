@@ -14,6 +14,7 @@ import numpy
 import getpass
 
 import xslurm_shared
+import ipyparallel
 
 mylocal_id = xslurm_shared.short_name(xslurm_shared.get_hostname())
 
@@ -258,17 +259,21 @@ class JobManager(object):
     
     def request_jobs(self, myid,current_cpu, current_mem):
         #add_log_line(gb,"Node %s requests for job with %d cpus and %d mb mem within %s time" % (myid, current_cpu, current_mem, (5 * 24 * 60.0) - current_time), BLUE)
-        if not myid in engines.engine_by_id:
+        if not myid in engines.engine_by_id or engines.engine_by_id[myid] is None:
             timeleft = 5 * 24 * 60 * 60
+            cores = 24
+            totmem = 64000
         else:
             timeleft = engines.engine_by_id[myid].timeleft
+            cores = engines.engine_by_id[myid].cores
+            totmem = engines.engine_by_id[myid].totmem
 
         self.lock.acquire()
         try:
             allres = []
             for job in self.jobs_by_id.values():
                 #FIXME; assume 5 days of time
-                if job.state in queue_states and job.reqtime <= timeleft:
+                if job.state in queue_states and job.reqtime <= timeleft and job.ncpu <= cores and job.mem <= totmem:
                     if not (job.ncpu <= current_cpu and job.mem <= current_mem):
                         job.state = 'ASSIGNED'
                         add_log_line(gb,"Job %s (id: %s) assigned to node %s (%d/%d remaining)" % (job.job_name, job.jobid, myid, current_cpu-job.ncpu, current_mem-job.mem), BLUE)
@@ -366,6 +371,7 @@ class JobManager(object):
 
                 if return_code != 0 and return_code != -255 and job.requeue > 0: #-255 is cancelled
                     job.requeue -= 1
+                    job.mem = job.mem * 2
                     job.state = 'REQUEUED'
                     job.starttime = None
                 else:
@@ -398,7 +404,7 @@ class JobManager(object):
         else:
             reason = 'Job Failed (errorcode: %d)' % return_code
 
-
+        name = 'unknown'
         try:
             if not jobid in self.jobs_by_id:
                 add_log_line(gb,"Unknown job (id: %s) completed at %s (%s)" % (jobid, myid, reason),YELLOW)
@@ -443,7 +449,7 @@ class Engine(object):
         self.cores = cores
         self.totmem = totmem
         self.starttime = time.time()
-        self.timeleft = None
+        self.timeleft = 5 * 24 * 60 * 60
         self.lastseen = time.time()
 
         self.pending_commands = []
@@ -526,7 +532,9 @@ class EngineManager(object):
         for cid,engine in list(self.engine_by_clusterid.items()):
             if not engine is None:
                 if not engine.engine_id in observed_cluster_engines:
-                    add_log_line(gb, 'Engine %s disappeared from Slurm..' % engine.engine_id, YELLOW)
+                    add_log_line(gb, 'Engine %s disappeared from Slurm..' % engine.engine_id, RED)
+                    self._unregister(engine.engine_id, 'Engine disappeared')
+
                     #should timeout automatically
                     del self.engine_by_clusterid[cid]
             elif not cid in observed_cluster_ids:
@@ -750,8 +758,8 @@ class EngineManager(object):
             e.lastseen = time.time()
            
             commands = e.pending_commands
-            # kill if idle, but not if local engine or if started in last 60 seconds
-            if idle and status.kill_idle and not myid == status.address.split('-')[0] and not ((e.lastseen - e.starttime) < 60):
+            # kill if idle for 3 minutes, but not if local engine 
+            if idle > 180.0 and status.kill_idle and not myid == status.address.split('-')[0]:
                 add_log_line(gb,"Stopping idle engine: " + myid, YELLOW)
 
                 commands.append((xslurm_shared.STOP,None))
@@ -931,7 +939,10 @@ def get_stat_str(stats):
 
 #thread display status
 def thread_display_status(gb,status):
+    counter = 9
+    completed = queue = running = 0
     while not status.stop_status_display:
+        counter += 1
         local_running = engines.check_local_engine()
         equeue = engines.cluster_queued_engines
         erunning = engines.cluster_running_engines
@@ -940,6 +951,28 @@ def thread_display_status(gb,status):
         #active_engines = jobs.active_engines()
         #active_engines.discard(mylocal_id)
         #eactive = len(active_engines)
+
+        if counter >= 10:
+            rc = None
+            try:
+                sys.stdout = open(os.devnull,'w')
+                rc = ipyparallel.Client(timeout=0.5)
+                queue = rc.queue_status()
+                unassigned= queue['unassigned']
+                del queue['unassigned']
+                
+                completed = sum([value['completed'] for key,value in queue.items() if isinstance(key,int)],0)
+                nqueue = sum([value['queue'] for key,value in queue.items() if isinstance(key,int)],0)
+                running = sum([value['tasks'] for key,value in queue.items() if isinstance(key,int)],0)
+                queue = nqueue + unassigned
+            except Exception, e:
+                pass
+            finally:
+                sys.stdout = sys.__stdout__
+                if not rc is None:
+                    rc.close()
+            counter = 0
+       
         
         gb.lock.acquire()
         try:
@@ -985,8 +1018,11 @@ def thread_display_status(gb,status):
                 gb.wcom_status.addstr(9,1,"Mem usage (GB): ")
                 gb.wcom_status.addstr(9,18, "%d/%d (%.2f - %.2f - %.2f - %.2f - %.2f)" \
                         % ((numpy.sum(status.used_mem), numpy.sum(status.total_mem)) + tuple(mem_usage)), curses.color_pair(mem_c))
-                                                                                                           
-                
+                                                     
+                if not rc is None:
+                    gb.wcom_status.addstr(11,1,"IPEngines: ")
+                    gb.wcom_status.addstr(11,18, "%d / %d / %d" % (running, queue, completed), curses.color_pair(GREEN))
+
                 if equeue == 0:
                     color = GREEN
                 else:
